@@ -9,9 +9,7 @@ from wtforms.fields import HiddenField as WTFormsHiddenField
 from wtforms.fields import SubmitField as WTFormsSubmitField
 from wtforms.widgets import html_params
 
-from nucleus.form_fields import BtnSubmitField, HiddenField
-from nucleus.helper_functions import flash
-from nucleus.template_helpers import grammatical_join
+from flask_formation.helpers import grammatical_join
 
 
 #######  Exception Classes  #######
@@ -31,16 +29,30 @@ class FormValidationError(TriggerTemplateRender):
 class FormationDefaults:
     @classmethod
     def create_submit_field(cls) -> WTFormsSubmitField:
-        return BtnSubmitField("Save")
+        raise NotImplementedError("create_submit_field must be overridden")
+
+    @classmethod
+    def create_hidden_field(cls):
+        return WTFormsHiddenField()
+
+    @classmethod
+    def create_form_timestamp_field(cls):
+        return cls.create_hidden_field()
+
+    @classmethod
+    def create_form_hash_field(cls):
+        return cls.create_hidden_field()
 
 
 class FormationForm(FlaskForm, FormationDefaults):
-    form_hash = HiddenField()
-    form_timestamp = HiddenField()
+    # form_hash = HiddenField()
+    # form_timestamp = HiddenField()
 
     # Form flags
     db_obj: dict
     delete_sub_form: Optional["FormationDeleteSubForm"]
+    form_hash: WTFormsHiddenField
+    form_timestamp: WTFormsHiddenField
 
     def _set_default_form_attr(self, attr_name: str, default):
         if not hasattr(self, attr_name):
@@ -72,7 +84,6 @@ class FormationForm(FlaskForm, FormationDefaults):
         error_field_labels = [
             getattr(self, field_name).label.text for field_name in self.errors
         ]
-        # return f": {grammatical_join(error_field_labels)}"
 
         # Set the error message prefix
         if len(error_field_labels) == 1:
@@ -94,6 +105,12 @@ class FormationForm(FlaskForm, FormationDefaults):
 
         # #######  Add submit field to form  #######
         self._unbound_fields.append(("submit_field", self.create_submit_field()))
+
+        # #######  Add form hidden fields  #######
+        self._unbound_fields.append(("form_hash", self.create_form_hash_field()))
+        self._unbound_fields.append(
+            ("form_timestamp", self.create_form_timestamp_field())
+        )
 
         #######  Set field values  #######
         field_values = {}
@@ -265,13 +282,18 @@ class FormationRenderForm(FormationForm):
 class FormationDeleteSubForm(FormationForm):
     base_form: FormationForm
 
-    delete_sub_form_object_id = HiddenField()
+    delete_sub_form_object_id: WTFormsHiddenField
+
+    @classmethod
+    def create_object_id_field(cls):
+        return cls.create_hidden_field()
 
     @property
     def form_id(self):
         return f"{self.base_form.form_id}_delete-form"
 
     def create_submit_field(self):
+        raise NotImplementedError("create_submit_field must be overridden")
         return BtnSubmitField("Yes, Delete it Forever", render_kw={"class": "delete"})
 
     def __init__(
@@ -281,6 +303,11 @@ class FormationDeleteSubForm(FormationForm):
         obj_name=None,
         **kwargs,
     ):
+        # #######  Add form hidden fields  #######
+        self._unbound_fields.append(
+            ("delete_sub_form_object_id", self.create_object_id_field())
+        )
+
         #######  Set default form attributes  #######
         self._set_default_form_attr("base_form", base_form)
 
@@ -300,13 +327,6 @@ class FormationDeleteSubForm(FormationForm):
 
         # Use hashlib to generate a unique hash based on the unique string
         return hashlib.sha256(class_name.encode()).hexdigest()
-
-    def on_form_success(self):
-        return flash(
-            f"{self.obj_name} successfully deleted.",
-            category="success",
-            title="Deleted",
-        )
 
     def on_submit(self):
         return_val = self.base_form.on_delete_submit(self)
