@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flask_formation"
+version = "0.1.0"
+description = "Sub package for flask-wtf forms"
+readme = "README.md"
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+authors = [
+    { name="Tyler Petrov", email="tylerpetrov16@gmail.com" },
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Tyler-Petrov/flask_formation"
+"Issues" = "https://github.com/Tyler-Petrov/flask_formation/issues"
