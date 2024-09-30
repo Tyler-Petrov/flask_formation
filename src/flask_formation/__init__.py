@@ -1,15 +1,34 @@
 import hashlib
 import re
+import typing as t
 from typing import Optional
 
 from flask import g, redirect, request
 from flask_wtf import FlaskForm
 from markupsafe import Markup
+from wtforms import Field
 from wtforms.fields import HiddenField as WTFormsHiddenField
 from wtforms.fields import SubmitField as WTFormsSubmitField
-from wtforms.widgets import html_params
+from wtforms.widgets import Input, html_params
 
 from flask_formation.helpers import grammatical_join
+
+
+class SectionLabelWidget(Input):
+    def __call__(self, field) -> Markup:
+        return Markup(
+            " ".join(
+                [
+                    '<h5 class="form-section-label">',
+                    field.label.text,
+                    "</h5>",
+                ]
+            )
+        )
+
+
+class SectionLabel(Field):
+    widget = SectionLabelWidget()
 
 
 #######  Exception Classes  #######
@@ -131,12 +150,18 @@ class FormationForm(FlaskForm, FormationDefaults):
         #######  Store form for submission later #######
         g.setdefault("formation_forms", []).append(self)
 
-    def input_fields(self):
+    def form_elements(self):
         for _, field in self._fields.items():
             # Don't yield the submit field
             if field.id == "submit_field":
                 continue
             if isinstance(field, WTFormsHiddenField):
+                continue
+            yield field
+
+    def input_fields(self):
+        for field in self.form_elements():
+            if isinstance(field, SectionLabel):
                 continue
             yield field
 
@@ -212,6 +237,7 @@ class FormationRenderForm(FormationForm):
     # Form flags
     obj_name: str | None
     static_info: dict
+    form_element_types = Field | SectionLabel
 
     @property
     def form_id(self):
@@ -267,7 +293,7 @@ class FormationRenderForm(FormationForm):
             f"<form {html_params(**form_kwargs)}>",
             self.hidden_tag(),
             "".join(pre_form_html),
-            *[field() for field in self.input_fields()],
+            *[field() for field in self.form_elements()],
             '<div class="submit-row">',
             self.submit_field(),
             "".join(submit_row_buttons),
