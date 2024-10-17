@@ -19,7 +19,7 @@ class SectionLabelWidget(Input):
         return Markup(
             " ".join(
                 [
-                    '<h5 class="form-section-label">',
+                    f'<h5 class="form-section-label" id="{field.id}">',
                     field.label.text,
                     "</h5>",
                 ]
