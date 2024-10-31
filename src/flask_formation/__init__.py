@@ -47,7 +47,7 @@ class FormValidationError(TriggerTemplateRender):
 #######  Form Classes  #######
 class FormationDefaults:
     @classmethod
-    def create_submit_field(cls) -> WTFormsSubmitField:
+    def create_submit_field(cls) -> WTFormsSubmitField | None:
         raise NotImplementedError("create_submit_field must be overridden")
 
     @classmethod
@@ -123,7 +123,9 @@ class FormationForm(FlaskForm, FormationDefaults):
         self._set_default_form_attr("db_obj", db_obj)
 
         # #######  Add submit field to form  #######
-        self._unbound_fields.append(("submit_field", self.create_submit_field()))
+        submit_field = self.create_submit_field()
+        if submit_field:
+            self._unbound_fields.append(("submit_field", submit_field))
 
         # #######  Add form hidden fields  #######
         self._unbound_fields.append(("form_hash", self.create_form_hash_field()))
@@ -289,15 +291,24 @@ class FormationRenderForm(FormationForm):
             # Set the form error message to a data attr to be handled with css
             form_kwargs.setdefault("data-error-message", self.error_message())
 
+        submit_row = []
+        # If there's a submit button defined then render it
+        if hasattr(self, "submit_field"):
+            submit_row.extend(
+                [
+                    '<div class="submit-row">',
+                    self.submit_field(),
+                    "".join(submit_row_buttons),
+                    "</div>",
+                ]
+            )
+
         form_html = [
             f"<form {html_params(**form_kwargs)}>",
             self.hidden_tag(),
             "".join(pre_form_html),
             *[field() for field in self.form_elements()],
-            '<div class="submit-row">',
-            self.submit_field(),
-            "".join(submit_row_buttons),
-            "</div>",
+            "".join(submit_row),
             "</form>",
             "".join(post_form_html),
         ]
