@@ -1,374 +1,398 @@
-import hashlib
-import re
+import copy
+import types
 import typing as t
-from typing import Optional
 
-from flask import g, redirect, request
+from flask import Response, abort, g, make_response, redirect, request
 from flask_wtf import FlaskForm
-from markupsafe import Markup
-from wtforms import Field
-from wtforms.fields import HiddenField as WTFormsHiddenField
-from wtforms.fields import SubmitField as WTFormsSubmitField
-from wtforms.widgets import Input, html_params
+from flask_wtf.form import _Auto
+from multidict import MultiDict
+from werkzeug.datastructures import CombinedMultiDict, ImmutableMultiDict
+from werkzeug.utils import cached_property
+from wtforms import Field, HiddenField, SubmitField
+from wtforms.fields.core import UnboundField
 
-from flask_formation.helpers import grammatical_join
+from flask_formation.class_helpers import Labeler
+from flask_formation.dictionary_helpers import (
+    update_nested_dictionary_with_format_string,
+)
+from flask_formation.exception import (
+    FormNotSubmitted,
+    FormNotValidated,
+    RerenderTemplate,
+)
+from flask_formation.field import SubmitButtonField
+from flask_formation.class_helpers import update_attributes
+from flask_formation.type import Document
+from flask_formation.widget import BasicFormWidget, FormWidget
 
 
-class SectionLabelWidget(Input):
-    def __call__(self, field) -> Markup:
-        return Markup(
-            " ".join(
-                [
-                    f'<h5 class="form-section-label" id="{field.id}">',
-                    field.label.text,
-                    "</h5>",
-                ]
-            )
+class Form(Labeler, FlaskForm):
+    """
+    A form class that wraps FlaskForm.
+
+    Key form events are handled by overridable methods:
+
+        Valid Submission (valid_form_handler):
+            Method for handling a valid form submission when all goes well.
+
+        Invalid Submission (invalid_form_handler):
+            A method for handling a form submission when the user sends a invalid form data.
+
+        Catastrophic Submission (error_form_handler):
+            A method for handling a python error during one of the other handlers.
+            This is perfect for logging the error.
+
+    This class also supports building a form's default values from a document(Mapping type).
+    """
+
+    formdata: MultiDict | None = None
+
+    submit_field_name = "submit_field"
+    id_field_name = "form_id_field"
+    form_tag_field_name = "form_tag_field"
+    document_default_attribute_name = "document_default"
+
+    document: Document = lambda: {}
+
+    @cached_property
+    def csrf_token_string(self) -> str:
+        """The csrf token in string form."""
+        if not hasattr(self, "meta"):
+            self.meta = self.Meta()
+        return self.meta.csrf_class.generate_csrf_token(self, None)
+
+    @cached_property
+    def field_defaults(self) -> dict:
+        """A dictionary of field-name and default value for a WTForms field.
+        This overrides on a per field basis the document default for that field.
+
+        Returns:
+            dict: Dictionary
+        """
+        if not hasattr(self, "meta"):
+            self.meta = self.Meta()
+        return {self.meta.csrf_field_name: self.csrf_token_string}
+
+    @cached_property
+    def widget_defaults(self) -> dict[str, t.Any]:
+        """A dictionary of defaults passed into this a form widget's __init__ method.
+        They correspond to attributes on the widget's instance.
+        They can be overridden by Form.render key word arguments.
+
+        Returns:
+            dict: Dictionary with strings as it's keys.
+        """
+        return {}
+
+    form_id_field = HiddenField()
+    form_tag_field = HiddenField()
+
+    submit_field = SubmitButtonField()
+
+    @cached_property
+    def form_tag(self) -> str:
+        """This tells each form apart. It can be overwritten by a subclass as well
+
+        Returns:
+            str: String identifier for this form class.
+        """
+        return self.snake_name()
+
+    def input_fields(self) -> t.Iterable[Field]:
+        """Yields fields that are used for inputs. Hidden fields and submit fields are excluded."""
+        for field in self._fields.values():
+            if isinstance(field, (HiddenField, SubmitButtonField, SubmitField)):
+                continue
+            yield field
+
+    def document_fields(self) -> t.Iterable[Field]:
+        """Yields all fields that have their value set by the document."""
+        for field in self.input_fields():
+            if not getattr(field, self.document_default_attribute_name, None):
+                continue
+            yield field
+
+    class Meta(FlaskForm.Meta):
+        def wrap_formdata(self, form: "Form", formdata):
+            # return None
+            if formdata is _Auto:
+                if form.is_submitted():
+                    if request.files:
+                        return CombinedMultiDict((request.files, request.form))
+                    elif request.form:
+                        return request.form
+                    elif request.is_json:
+                        return ImmutableMultiDict(request.get_json())
+
+                return None
+
+            return formdata
+
+    @staticmethod
+    def unbound_field_bind(self: UnboundField, form: "Form", **kwargs) -> Field:
+        """The custom bind function called on UnboundFields when binding them to this form.
+        It simply handles the "document_default" argument supplied into a field,
+            so it doesn't need to be handled directly by the field.
+        This function also calls the original .bind() method on the field's __class__ (UnboundField in most cases).
+
+        Args:
+            self (UnboundField): WTForms UnboundField.
+            form (Form): A FormationForm.
+
+        Returns:
+            Field: A bound WTForms Field.
+        """
+        # Save unbound field state
+        unbound_field_state = copy.deepcopy(self.__dict__)
+
+        # Pop custom arguments
+        document_default: bool | str = self.kwargs.pop(
+            form.document_default_attribute_name, True
+        )
+        include_in_widget: bool | callable[bool] = self.kwargs.pop(
+            "include_in_widget", True
         )
 
+        # Explicitly call the parent class's bind method
+        bound_field: Field = self.__class__.bind(self, form=form, **kwargs)
 
-class SectionLabel(Field):
-    widget = SectionLabelWidget()
+        # Set document_default
+        setattr(bound_field, form.document_default_attribute_name, document_default)
+        setattr(bound_field, "include_in_widget", include_in_widget)
 
+        # Replace unbound field state
+        self.__dict__ = unbound_field_state
 
-#######  Exception Classes  #######
-class TriggerTemplateRender(Exception):
-    pass
+        return bound_field
 
+    def __init__(self, formdata=_Auto, **kwargs):
+        """This method initializes the form and handles the submission from the client if there is one.
+        Extra key word arguments are used to set one of the following:
+            - Default value of a field if the key is a field name
+            - Attributes on the current instance of this class
 
-class ObsoleteFormData(Exception):
-    pass
+        If there is a field named submit_field it is moved to the bottom of the _fields dictionary.
 
+        Note: If a form is submitted then the endpoint stops at that form.
+        This means code after a submitted forms initialization won't be run. Be mindful of cleanup code.
 
-class FormValidationError(TriggerTemplateRender):
-    pass
+        Warning: The .bind() method on UnboundFields for this form will be wrapped with a function.
+            This function pops document_default from this form's fields key word arguments and saves it as a field attribute.
+            This function is a staticmethod on flask_formation.Form called unbound_field_bind
 
+        Args:
+            formdata (Any): Passed into super.__init__(...) call. Defaults to flask_wtf.form._Auto.
 
-#######  Form Classes  #######
-class FormationDefaults:
-    @classmethod
-    def create_submit_field(cls) -> WTFormsSubmitField | None:
-        raise NotImplementedError("create_submit_field must be overridden")
-
-    @classmethod
-    def create_hidden_field(cls):
-        return WTFormsHiddenField()
-
-    @classmethod
-    def create_form_timestamp_field(cls):
-        return cls.create_hidden_field()
-
-    @classmethod
-    def create_form_hash_field(cls):
-        return cls.create_hidden_field()
-
-
-class FormationForm(FlaskForm, FormationDefaults):
-    # form_hash = HiddenField()
-    # form_timestamp = HiddenField()
-
-    # Form flags
-    db_obj: dict
-    delete_sub_form: Optional["FormationDeleteSubForm"]
-    form_hash: WTFormsHiddenField
-    form_timestamp: WTFormsHiddenField
-
-    def _set_default_form_attr(self, attr_name: str, default):
-        if not hasattr(self, attr_name):
-            setattr(self, attr_name, default)
-        # return getattr(self, attr_name)
-
-    def _generate_form_hash(self):
-        # Get the class name
-        class_name = self.__class__.__name__
-        # Use hashlib to generate a unique hash based on the form class name
-        return hashlib.sha256(class_name.encode()).hexdigest()
-
-    def _validate_form_hash(self, potential_form_hash: str | None = None):
-        # Default potential_form_hash to the form hash field
-        if potential_form_hash is None:
-            potential_form_hash = self.form_hash.data
-
-        # Check if the potential form hash is valid
-        return self._generate_form_hash() == potential_form_hash
-
-    def get_form_timestamp(self):
-        pass
-
-    def check_form_timestamp(self):
-        return True
-
-    def error_message(self):
-        # Get the labels of all field that have an error
-        error_field_labels = [
-            getattr(self, field_name).label.text for field_name in self.errors
+        Raises:
+            AssertionError: When there isn't a form tag field in this form.
+                This field is required so flask_formation knows which form was submitted.
+        """
+        # Get the names of all the fields
+        unbound_field_names = [
+            field.name or field_name for field_name, field in self._unbound_fields
         ]
-
-        # Set the error message prefix
-        if len(error_field_labels) == 1:
-            error_message_prefix = "This field has an error"
-        else:
-            error_message_prefix = "These fields have errors"
-
-        # Concatenate the prefix with the error fields joined by a grammatical join
-        return f"{error_message_prefix}: {grammatical_join(error_field_labels)}"
-
-    def __init__(
-        self,
-        *args,
-        db_obj=None,
-        **kwargs,
-    ):
-        #######  Set default form attributes  #######
-        self._set_default_form_attr("db_obj", db_obj)
-
-        # #######  Add submit field to form  #######
-        submit_field = self.create_submit_field()
-        if submit_field:
-            self._unbound_fields.append(("submit_field", submit_field))
-
-        # #######  Add form hidden fields  #######
-        self._unbound_fields.append(("form_hash", self.create_form_hash_field()))
-        self._unbound_fields.append(
-            ("form_timestamp", self.create_form_timestamp_field())
+        # Strip the key value pairs from kwargs that set field default values
+        self.field_defaults: dict = self.field_defaults
+        self.field_defaults.update(
+            {
+                field_name: kwargs.pop(field_name)
+                for field_name in list(kwargs)
+                if field_name in unbound_field_names
+            }
         )
+        self.field_defaults.setdefault(self.form_tag_field_name, self.form_tag)
 
-        #######  Set field values  #######
-        field_values = {}
-        if request.method == "GET":
-            # Set the form hash to the form_hash hidden field on the form
-            field_values["form_hash"] = self._generate_form_hash()
-
-            # Set form timestamp
-            if ts := self.get_form_timestamp():
-                field_values["form_timestamp"] = ts
-
-        #######  Call super init  #######
-        super().__init__(*args, **kwargs, **field_values)
-
-        #######  Delete Sub Form #######
-        self.delete_sub_form = self.build_delete_sub_form()
-
-        #######  Store form for submission later #######
-        g.setdefault("formation_forms", []).append(self)
-
-    def form_elements(self):
-        for _, field in self._fields.items():
-            # Don't yield the submit field
-            if field.id == "submit_field":
-                continue
-            if isinstance(field, WTFormsHiddenField):
-                continue
-            yield field
-
-    def input_fields(self):
-        for field in self.form_elements():
-            if isinstance(field, SectionLabel):
-                continue
-            yield field
-
-    def input_fields_as_dict(self):
-        return {field.id: field.data for field in self.input_fields()}
-
-    def db_fields(self):
-        for _, field in self._fields.items():
-            # Don't yield the submit field
-            if field.id == "submit_field":
-                continue
-            if not hasattr(field, "db_field") or not field.db_field:
-                continue
-            yield field
-
-    def db_fields_as_dict(self):
-        return {field.id: field.data for field in self.db_fields()}
-
-    #######  During Submit Handlers  #######
-    def check_submission(self):
-        return self.is_submitted() and self._validate_form_hash()
-
-    def validate_submission(self):
-        if self.check_submission() and self.validate():
-            if self.check_form_timestamp():
-                return True
-            raise ObsoleteFormData
-        return False
-
-    def on_form_success(self):
-        pass
-
-    def on_form_validation_error(self):
-        pass
-
-    def on_obsolete_form_data(self):
-        pass
-
-    def on_form_handling_error(self):
-        pass
-
-    def handle_submission(self):
-        try:
-            if not self.check_submission():
-                return False
-            if not self.validate_submission():
-                raise FormValidationError
-
-            form_response = self.on_submit() or redirect(request.url)
-            self.on_form_success()
-            return form_response
-
-        except FormValidationError:
-            self.on_form_validation_error()
-            raise
-        # Reraise trigger template render "error" so it bubbles up to the render form template
-        except TriggerTemplateRender:
-            raise
-        except ObsoleteFormData:
-            return self.on_obsolete_form_data() or redirect(request.url)
-        except:
-            self.on_form_handling_error()
-            raise TriggerTemplateRender(
-                "Form had errors on submission so rerender the template"
+        for _, unbound_field in self._unbound_fields:
+            unbound_field.bind = types.MethodType(
+                self.unbound_field_bind, unbound_field
             )
 
-    #######  Delete Sub Form #######
-    def build_delete_sub_form(self) -> Optional["FormationDeleteSubForm"]:
-        pass
+        # call super __init__
+        meta = self.Meta()
+        self.formdata = meta.wrap_formdata(self, formdata)
+        super().__init__(formdata=self.formdata, **self.field_defaults)
 
+        # Assert that this form has a form tag field
+        assert (
+            self.form_tag_field_name in self._fields
+        ), f"The field {repr(self.form_tag_field_name)} is required for this Form to operate"
 
-class FormationRenderForm(FormationForm):
-    # Form flags
-    obj_name: str | None
-    static_info: dict
-    form_element_types = Field | SectionLabel
+        # Ensure submit_field is moved to the end of the _fields map and thus rendered last
+        if self.submit_field_name in self._fields:
+            # Remove the submit field temporarily
+            submit_field = self._fields.pop(self.submit_field_name)
+            # Re-add the submit field to the end
+            self._fields[self.submit_field_name] = submit_field
 
-    @property
-    def form_id(self):
-        # Get the form class name
-        class_name = self.__class__.__name__
-        # Split class name on uppercase letters
-        words = re.findall("[A-Z][a-z]*", class_name)
-        # Join lowercased class name words with underscore
-        form_id = "_".join(words).lower()
+        # Set form attributes from extra key word arguments
+        update_attributes(self, **kwargs)
 
-        return form_id
+        if callable(self.document):
+            self.document = self.document.__func__()
 
-    def __init__(
-        self,
-        *args,
-        db_obj=None,
-        obj_name=None,
-        static_info=None,
-        **kwargs,
-    ):
-        super().__init__(
-            *args,
-            db_obj=db_obj,
-            **kwargs,
+        try:
+            formation_response = self.submission_handler()
+            return abort(formation_response)
+        except FormNotSubmitted:
+            pass
+        except RerenderTemplate:
+            pass
+
+    def field2document_key(self, field: "Field") -> str:
+        """Overridable method for getting the key/attribute-name used on the widget's document
+        when getting the default value for a form field from the widget's document.
+
+        Args:
+            field (Field): Any wtforms field or object with an id attribute.
+
+        Returns:
+            str: Defaults to the field's short_name.
+        """
+
+        return field.short_name
+
+    def widget_builder(self, widget: FormWidget, **widget_kwargs) -> FormWidget:
+        """A builder for the widget parameter built with all extra key values supplied.
+
+        Args:
+            widget (FormWidget): Any flask_formation FormWidget subclass.
+
+        Returns:
+            FormWidget: An instance on the widget parameter.
+        """
+        combined_widget_kwargs = update_nested_dictionary_with_format_string(
+            self.widget_defaults, widget_kwargs, format_undefined_value=False
         )
+        combined_widget_kwargs.setdefault("document", self.document)
 
-        self._set_default_form_attr("obj_name", obj_name)
-        self._set_default_form_attr("static_info", static_info or {})
+        return widget(form=self, **combined_widget_kwargs)
 
     def render(
         self,
-        pre_form_html: list | None = None,
-        post_form_html: list | None = None,
-        submit_row_buttons: list | None = None,
-        **form_kwargs,
+        widget: FormWidget = BasicFormWidget,
+        **widget_kwargs,
     ):
-        # Handle mutable function params
-        if pre_form_html is None:
-            pre_form_html = []
-        if post_form_html is None:
-            post_form_html = []
-        if submit_row_buttons is None:
-            submit_row_buttons = []
+        """Directly renders the widget class supplied after building the widget.
 
-        # Form Rendering
-        form_kwargs.setdefault("method", "post")
-        form_kwargs.setdefault("id", self.form_id)
-        if self.errors:
-            # Set the form error message to a data attr to be handled with css
-            form_kwargs.setdefault("data-error-message", self.error_message())
+        Args:
+            widget (FormWidget, optional): Any flask_formation FormWidget subclass. Defaults to BasicFormWidget.
 
-        submit_row = []
-        # If there's a submit button defined then render it
-        if hasattr(self, "submit_field"):
-            submit_row.extend(
-                [
-                    '<div class="submit-row">',
-                    self.submit_field(),
-                    "".join(submit_row_buttons),
-                    "</div>",
-                ]
-            )
+        Returns:
+            Markup: The rendered Markup for the widget supplied.
+        """
+        return self.widget_builder(widget=widget, **widget_kwargs).render()
 
-        form_html = [
-            f"<form {html_params(**form_kwargs)}>",
-            self.hidden_tag(),
-            "".join(pre_form_html),
-            *[field() for field in self.form_elements()],
-            "".join(submit_row),
-            "</form>",
-            "".join(post_form_html),
-        ]
+    def validate(self, extra_validators=None):
+        try:
+            assert self.authorize_document()
+        except AssertionError as e:
+            message = str(e or "You don't have permission to perform that action")
+            self.form_errors.append(message)
+            raise FormNotValidated(message)
+        return super().validate(extra_validators)
 
-        return Markup("".join(form_html))
+    def submission_handler(self) -> Response | None:
+        """This method can be called an any time.  It delegates functionality to other more single use methods.
+        First there's a check if this form was submitted.
+        If this form was submitted and is validated then a flask.Response is made using flask.make_request.
+            The body of this request is the response from valid_form_handler() or the default form response.
+        If submitted but not validated then the invalid_form_handler() is called and a RerenderTemplate is triggered.
 
+        Raises:
+            FormNotSubmitted: If this form wasn't submitted. From .is_submitted()
+            FormNotValidated: Internally handled if this form wasn't validated. From .validate()
+            RerenderTemplate: Exception to trigger a rerender of the jinja template.
+                Simply means that the form request isn't handled and the template is rerendered.
 
-class FormationDeleteSubForm(FormationForm):
-    base_form: FormationForm
+        Returns:
+            Response: Success response to be sent to the client.
+        """
+        if not self.is_submitted():
+            raise FormNotSubmitted
 
-    delete_sub_form_object_id: WTFormsHiddenField
+        try:
+            if self.validate():
+                response = make_response(
+                    self.valid_form_handler() or self.default_form_response()
+                )
+                self.success_form_handler()
+                return response
+            else:
+                raise FormNotValidated(
+                    f"Validation error for {self.class_name()} form.  Errors were {self.errors}"
+                )
 
-    @classmethod
-    def create_object_id_field(cls):
-        return cls.create_hidden_field()
+        except FormNotValidated as exception:
+            self.invalid_form_handler()
+            g.formation_error_form = self
+            raise RerenderTemplate from exception
 
-    @property
-    def form_id(self):
-        return f"{self.base_form.form_id}_delete-form"
+        except Exception as exception:
+            self.error_form_handler(exception)
+            raise RerenderTemplate from exception
 
-    def create_submit_field(self):
-        raise NotImplementedError("create_submit_field must be overridden")
-        return BtnSubmitField("Yes, Delete it Forever", render_kw={"class": "delete"})
+    def form_tag_field_validator(self):
+        """Return boolean of whether form_tag_field from form data is equal to self.form_tag.
+        The formdata from this class hasn't been set yet as this is the check on whether to set the formdata to this form.
 
-    def __init__(
-        self,
-        *args,
-        base_form=None,
-        obj_name=None,
-        **kwargs,
-    ):
-        # #######  Add form hidden fields  #######
-        self._unbound_fields.append(
-            ("delete_sub_form_object_id", self.create_object_id_field())
-        )
+        Returns:
+            bool: True or False
+        """
+        return request.form.get(self.form_tag_field_name) == self.form_tag
 
-        #######  Set default form attributes  #######
-        self._set_default_form_attr("base_form", base_form)
+    def is_submitted(self) -> bool:
+        """Checks if this form was submitted from the client.  Criteria are:
+            - HTTP methods (from super() call)
+            - form_tag field matches this form's tag
 
-        assert (
-            self.base_form is not None
-        ), "base_form must be set either in the class or when __init__ is called"
+        Returns:
+            bool: Whether this form was submitted
+        """
+        return super().is_submitted() and self.form_tag_field_validator()
 
-        super().__init__(*args, **kwargs)
+    def default_form_response(self):
+        """The default response if valid_form_handler doesn't return a truthy value.
 
-    @property
-    def object_id(self):
-        return self.delete_sub_form_object_id.unsigned_data
+        Returns:
+            Response: Redirect to current page.
+        """
+        return redirect(request.url)
 
-    def _generate_form_hash(self):
-        # Get the class name
-        class_name = f"{self.base_form.__class__.__name__}|delete_sub_form"
+    def authorize_document(self) -> bool:
+        """A validation function for whether this form's document is authorized.
+        Assertions are also excepted.
 
-        # Use hashlib to generate a unique hash based on the unique string
-        return hashlib.sha256(class_name.encode()).hexdigest()
+        Returns:
+            bool: Boolean or Any (will be evaluated into a Boolean)
+        """
+        return True
 
-    def on_submit(self):
-        return_val = self.base_form.on_delete_submit(self)
-        return return_val
+    def valid_form_handler(self) -> None | Response:
+        """Handles the form once it's validated.
 
+        Returns:
+            None: Response not specified, so the default response will be used.
+            Response: Response (or anything that flask.make_response takes) specified, so it will be send directly to the user
+        """
+        print("Valid form submission", self.class_name())
 
-class FormationRenderDeleteSubForm(FormationDeleteSubForm, FormationRenderForm):
-    pass
+    def success_form_handler(self):
+        """Handles the form once it's validated and valid_form_handler has finished.
+        Return value not used.
+        """
+        print("Success form submission", self.class_name())
+
+    def invalid_form_handler(self):
+        """Handles the form if there was a validation issue.
+        Return values are unused by flask_formation
+        """
+        print("Invalid form submission", self.errors, self.class_name())
+
+    def error_form_handler(self, exception: Exception):
+        """Handles any handling errors during a form submission. These would be catastrophic errors.
+        The ideal purpose would be to log the error here. The template is rerendered by default after error.
+
+        Args:
+            exception (Exception): The exception that caused this mess.
+        """
+        print("Error during form submission", exception, self.client_name())
